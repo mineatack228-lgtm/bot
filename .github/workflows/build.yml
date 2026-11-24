@@ -1,0 +1,657 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write project files
+        run: |
+          set -e
+          mkdir -p app app/src/main app/src/main/java/com/example/subwaybot app/src/main/res/values app/src/main/res/xml
+          cat > settings.gradle <<'__END_OF_FILE__'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "SubwayBot"
+          include ':app'
+          __END_OF_FILE__
+          cat > build.gradle <<'__END_OF_FILE__'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          __END_OF_FILE__
+          cat > gradle.properties <<'__END_OF_FILE__'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          __END_OF_FILE__
+          cat > app/build.gradle <<'__END_OF_FILE__'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.example.subwaybot'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.example.subwaybot'
+                  minSdk 29
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          __END_OF_FILE__
+          cat > app/src/main/AndroidManifest.xml <<'__END_OF_FILE__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Subway Bot">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".BotService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+
+                  <service
+                      android:name=".BotAccessibility"
+                      android:exported="true"
+                      android:label="Subway Bot"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          __END_OF_FILE__
+          cat > app/src/main/res/xml/accessibility_config.xml <<'__END_OF_FILE__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:notificationTimeout="50"
+              android:description="@string/a11y_desc" />
+          __END_OF_FILE__
+          cat > app/src/main/res/values/strings.xml <<'__END_OF_FILE__'
+          <resources>
+              <string name="a11y_desc">Нужно, чтобы бот мог делать свайпы в Subway Surfers. Работает только когда игра открыта.</string>
+          </resources>
+          __END_OF_FILE__
+          cat > app/src/main/java/com/example/subwaybot/Cfg.java <<'__END_OF_FILE__'
+          package com.example.subwaybot;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+
+          /** Настройки, которые меняются ползунками в приложении. */
+          final class Cfg {
+              static volatile int sat = 95;        // насыщенность, выше которой пиксель = препятствие
+              static volatile int blockPct = 22;   // % «препятствия» в зоне, после которого дорожка занята
+              static volatile int shift = 0;       // взгляд вперёд: + дальше, - ближе (в % высоты)
+              static volatile int playerY = 78;    // высота бегуна на экране, %
+              static volatile int spread = 30;     // разведение дорожек у ног бегуна, % ширины
+
+              static void load(Context c) {
+                  SharedPreferences p = c.getSharedPreferences("cfg", Context.MODE_PRIVATE);
+                  sat = p.getInt("sat", 95);
+                  blockPct = p.getInt("block", 22);
+                  shift = p.getInt("shift", 0);
+                  playerY = p.getInt("py", 78);
+                  spread = p.getInt("spread", 30);
+              }
+          }
+          __END_OF_FILE__
+          cat > app/src/main/java/com/example/subwaybot/Detector.java <<'__END_OF_FILE__'
+          package com.example.subwaybot;
+
+          import java.nio.ByteBuffer;
+
+          /** Зрение + мозг: ищет препятствия в трёх дорожках и решает, что делать. */
+          final class Detector {
+              static final int NONE = 0, LEFT = 1, RIGHT = 2, UP = 3;
+
+              private static final float HORIZON = 0.30f;   // где дорога сходится в точку
+              private static final float HALF_W = 0.12f;    // полуширина дорожки у ног бегуна
+              private static final float[][] BANDS = {{0.50f, 0.60f}, {0.40f, 0.50f}}; // ближняя, дальняя
+              private static final float[] WEIGHT = {1.0f, 0.75f};
+
+              /** Прямоугольник дорожки {x0, y0, x1, y1} в пикселях с учётом перспективы. */
+              static int[] zone(int lane, int band, int w, int h) {
+                  float shift = Cfg.shift / 100f;
+                  float y0 = BANDS[band][0] - shift;
+                  float y1 = BANDS[band][1] - shift;
+                  float playerY = Cfg.playerY / 100f;
+                  float t = Math.max(0.05f, ((y0 + y1) / 2f - HORIZON) / (playerY - HORIZON));
+                  float cx = 0.5f + (lane - 1) * (Cfg.spread / 100f) * t;
+                  float half = HALF_W * t;
+                  int x0 = clamp((int) ((cx - half) * w), 0, w - 2);
+                  int x1 = clamp((int) ((cx + half) * w), x0 + 1, w);
+                  int yy0 = clamp((int) (y0 * h), 0, h - 2);
+                  int yy1 = clamp((int) (y1 * h), yy0 + 1, h);
+                  return new int[]{x0, yy0, x1, yy1};
+              }
+
+              /** Опасность по каждой дорожке, 0..1. Буфер — RGBA. */
+              static float[] scan(ByteBuffer buf, int rowStride, int pixStride, int w, int h) {
+                  float[] danger = new float[3];
+                  for (int lane = 0; lane < 3; lane++) {
+                      float worst = 0f;
+                      for (int band = 0; band < 2; band++) {
+                          int[] z = zone(lane, band, w, h);
+                          worst = Math.max(worst, WEIGHT[band] * fill(buf, rowStride, pixStride, z));
+                      }
+                      danger[lane] = worst;
+                  }
+                  return danger;
+              }
+
+              private static float fill(ByteBuffer buf, int rs, int ps, int[] z) {
+                  int hit = 0, total = 0;
+                  for (int y = z[1]; y < z[3]; y += 2) {
+                      for (int x = z[0]; x < z[2]; x += 2) {
+                          int o = y * rs + x * ps;
+                          int r = buf.get(o) & 0xff;
+                          int g = buf.get(o + 1) & 0xff;
+                          int b = buf.get(o + 2) & 0xff;
+                          total++;
+                          if (blocked(r, g, b)) hit++;
+                      }
+                  }
+                  return total == 0 ? 0f : hit / (float) total;
+              }
+
+              private static boolean blocked(int r, int g, int b) {
+                  int max = Math.max(r, Math.max(g, b));
+                  int min = Math.min(r, Math.min(g, b));
+                  int d = max - min;
+                  int s = max == 0 ? 0 : d * 255 / max;
+                  if (max > 225 && s < 40) return true;     // белые полосы на барьерах
+                  if (s <= Cfg.sat || d == 0) return false; // серая дорога
+                  float h;
+                  if (max == r) h = 60f * (((g - b) / (float) d) % 6f);
+                  else if (max == g) h = 60f * ((b - r) / (float) d + 2f);
+                  else h = 60f * ((r - g) / (float) d + 4f);
+                  if (h < 0) h += 360f;
+                  return !(h > 30f && h < 76f);             // жёлтое (монетки) не считаем
+              }
+
+              /** Что делать: NONE / LEFT / RIGHT / UP (прыжок). */
+              static int plan(int lane, float[] d) {
+                  float block = Cfg.blockPct / 100f;
+                  if (d[lane] < block) return NONE;
+                  int best = 0;
+                  for (int l = 1; l < 3; l++) {
+                      if (d[l] < d[best] || (d[l] == d[best] && Math.abs(l - lane) < Math.abs(best - lane))) best = l;
+                  }
+                  if (best != lane && d[best] < block * 0.7f) {
+                      if (Math.abs(best - lane) == 2 && d[1] >= block) return UP; // через занятую середину не лезем
+                      return best < lane ? LEFT : RIGHT;
+                  }
+                  return UP; // свободных дорожек нет — прыгаем
+              }
+
+              private static int clamp(int v, int lo, int hi) {
+                  return Math.max(lo, Math.min(hi, v));
+              }
+          }
+          __END_OF_FILE__
+          cat > app/src/main/java/com/example/subwaybot/BotAccessibility.java <<'__END_OF_FILE__'
+          package com.example.subwaybot;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.accessibilityservice.GestureDescription;
+          import android.content.Intent;
+          import android.graphics.Path;
+          import android.view.accessibility.AccessibilityEvent;
+
+          /** Делает свайпы и следит, какое приложение сейчас на экране. */
+          public class BotAccessibility extends AccessibilityService {
+              static final String GAME_PKG = "com.kiloo.subwaysurf";
+              static volatile BotAccessibility instance;
+              static volatile String foreground = "";
+
+              static boolean gameInFront() {
+                  return GAME_PKG.equals(foreground);
+              }
+
+              @Override
+              protected void onServiceConnected() {
+                  instance = this;
+              }
+
+              @Override
+              public void onAccessibilityEvent(AccessibilityEvent e) {
+                  if (e.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && e.getPackageName() != null) {
+                      foreground = e.getPackageName().toString();
+                  }
+              }
+
+              @Override
+              public void onInterrupt() {
+              }
+
+              @Override
+              public boolean onUnbind(Intent intent) {
+                  instance = null;
+                  return super.onUnbind(intent);
+              }
+
+              void swipe(float x1, float y1, float x2, float y2) {
+                  Path p = new Path();
+                  p.moveTo(x1, y1);
+                  p.lineTo(x2, y2);
+                  GestureDescription.Builder b = new GestureDescription.Builder();
+                  b.addStroke(new GestureDescription.StrokeDescription(p, 0, 40));
+                  dispatchGesture(b.build(), null, null);
+              }
+          }
+          __END_OF_FILE__
+          cat > app/src/main/java/com/example/subwaybot/BotService.java <<'__END_OF_FILE__'
+          package com.example.subwaybot;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.ContentValues;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.graphics.PixelFormat;
+          import android.hardware.display.DisplayManager;
+          import android.hardware.display.VirtualDisplay;
+          import android.media.Image;
+          import android.media.ImageReader;
+          import android.media.projection.MediaProjection;
+          import android.media.projection.MediaProjectionManager;
+          import android.net.Uri;
+          import android.os.Handler;
+          import android.os.HandlerThread;
+          import android.os.IBinder;
+          import android.os.Looper;
+          import android.os.SystemClock;
+          import android.provider.MediaStore;
+          import android.widget.Toast;
+
+          import java.io.OutputStream;
+          import java.nio.ByteBuffer;
+          import java.util.Locale;
+
+          /** Захватывает экран, анализирует кадры и командует свайпами. */
+          public class BotService extends Service {
+              static final String ACTION_STOP = "com.example.subwaybot.STOP";
+              static final String ACTION_SNAP = "com.example.subwaybot.SNAP";
+              static volatile boolean running;
+
+              private MediaProjection projection;
+              private VirtualDisplay display;
+              private ImageReader reader;
+              private HandlerThread thread;
+              private int screenW, screenH;
+              private int lane = 1;
+              private boolean wasInGame;
+              private long busyUntil;
+              private volatile boolean snapRequested;
+
+              @Override
+              public IBinder onBind(Intent intent) {
+                  return null;
+              }
+
+              @Override
+              @SuppressWarnings("deprecation")
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  String action = intent == null ? null : intent.getAction();
+                  if (ACTION_STOP.equals(action)) {
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  if (ACTION_SNAP.equals(action)) {
+                      snapRequested = true;
+                      return START_NOT_STICKY;
+                  }
+                  if (running || intent == null || !intent.hasExtra("data")) return START_NOT_STICKY;
+
+                  Cfg.load(this);
+                  startForeground(1, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+
+                  screenW = intent.getIntExtra("w", 1080);
+                  screenH = intent.getIntExtra("h", 2400);
+                  int dpi = intent.getIntExtra("dpi", 420);
+                  int capW = Math.min(360, screenW);
+                  int capH = capW * screenH / screenW;
+
+                  Intent data = intent.getParcelableExtra("data");
+                  MediaProjectionManager mpm = getSystemService(MediaProjectionManager.class);
+                  projection = mpm.getMediaProjection(intent.getIntExtra("code", 0), data);
+
+                  thread = new HandlerThread("subwaybot");
+                  thread.start();
+                  Handler handler = new Handler(thread.getLooper());
+
+                  // Android 14+: колбэк нужно зарегистрировать до создания VirtualDisplay
+                  projection.registerCallback(new MediaProjection.Callback() {
+                      @Override
+                      public void onStop() {
+                          stopSelf();
+                      }
+                  }, handler);
+
+                  reader = ImageReader.newInstance(capW, capH, PixelFormat.RGBA_8888, 2);
+                  display = projection.createVirtualDisplay("subwaybot", capW, capH, dpi,
+                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.getSurface(), null, null);
+                  reader.setOnImageAvailableListener(this::onFrame, handler);
+
+                  running = true;
+                  return START_NOT_STICKY;
+              }
+
+              private void onFrame(ImageReader r) {
+                  Image img = r.acquireLatestImage();
+                  if (img == null) return;
+                  try {
+                      Image.Plane plane = img.getPlanes()[0];
+                      ByteBuffer buf = plane.getBuffer();
+                      int rs = plane.getRowStride();
+                      int ps = plane.getPixelStride();
+                      float[] d = Detector.scan(buf, rs, ps, img.getWidth(), img.getHeight());
+                      if (snapRequested) {
+                          snapRequested = false;
+                          saveSnapshot(buf, rs, ps, img.getWidth(), img.getHeight(), d);
+                      }
+                      act(d);
+                  } finally {
+                      img.close();
+                  }
+              }
+
+              private void act(float[] d) {
+                  BotAccessibility svc = BotAccessibility.instance;
+                  boolean inGame = BotAccessibility.gameInFront();
+                  if (inGame && !wasInGame) lane = 1; // зашли в игру — бегун по центру
+                  wasInGame = inGame;
+                  if (svc == null || !inGame) return;
+
+                  long now = SystemClock.uptimeMillis();
+                  if (now < busyUntil) return;
+
+                  int a = Detector.plan(lane, d);
+                  if (a == Detector.NONE) return;
+
+                  float cx = screenW / 2f, cy = screenH * 0.55f, step = screenW * 0.30f;
+                  if (a == Detector.LEFT) {
+                      svc.swipe(cx, cy, cx - step, cy);
+                      lane = Math.max(0, lane - 1);
+                      busyUntil = now + 280;
+                  } else if (a == Detector.RIGHT) {
+                      svc.swipe(cx, cy, cx + step, cy);
+                      lane = Math.min(2, lane + 1);
+                      busyUntil = now + 280;
+                  } else {
+                      svc.swipe(cx, cy, cx, cy - step);
+                      busyUntil = now + 550;
+                  }
+              }
+
+              /** Сохраняет в галерею (Pictures/SubwayBot) кадр с нарисованными зонами. */
+              private void saveSnapshot(ByteBuffer buf, int rs, int ps, int w, int h, float[] d) {
+                  try {
+                      Bitmap full = Bitmap.createBitmap(rs / ps, h, Bitmap.Config.ARGB_8888);
+                      buf.rewind();
+                      full.copyPixelsFromBuffer(buf);
+
+                      Canvas c = new Canvas(full);
+                      Paint p = new Paint();
+                      p.setStyle(Paint.Style.STROKE);
+                      p.setStrokeWidth(2f);
+                      float block = Cfg.blockPct / 100f;
+                      for (int ln = 0; ln < 3; ln++) {
+                          p.setColor(d[ln] >= block ? Color.RED : Color.GREEN);
+                          for (int band = 0; band < 2; band++) {
+                              int[] z = Detector.zone(ln, band, w, h);
+                              c.drawRect(z[0], z[1], z[2], z[3], p);
+                          }
+                      }
+                      Paint t = new Paint();
+                      t.setColor(Color.WHITE);
+                      t.setTextSize(18f);
+                      c.drawText(String.format(Locale.US, "L %.2f  M %.2f  R %.2f", d[0], d[1], d[2]), 6, 20, t);
+
+                      Bitmap out = Bitmap.createBitmap(full, 0, 0, w, h);
+                      ContentValues v = new ContentValues();
+                      v.put(MediaStore.Images.Media.DISPLAY_NAME, "subwaybot_" + System.currentTimeMillis() + ".png");
+                      v.put(MediaStore.Images.Media.MIME_TYPE, "image/png");
+                      v.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/SubwayBot");
+                      Uri uri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v);
+                      if (uri != null) {
+                          try (OutputStream os = getContentResolver().openOutputStream(uri)) {
+                              out.compress(Bitmap.CompressFormat.PNG, 100, os);
+                          }
+                      }
+                      toast("Снимок в галерее: Pictures/SubwayBot");
+                  } catch (Exception e) {
+                      toast("Не вышло сохранить снимок: " + e.getMessage());
+                  }
+              }
+
+              private void toast(String msg) {
+                  new Handler(Looper.getMainLooper()).post(() ->
+                          Toast.makeText(getApplicationContext(), msg, Toast.LENGTH_SHORT).show());
+              }
+
+              private Notification buildNotification() {
+                  NotificationManager nm = getSystemService(NotificationManager.class);
+                  nm.createNotificationChannel(new NotificationChannel("bot", "Subway Bot", NotificationManager.IMPORTANCE_LOW));
+                  return new Notification.Builder(this, "bot")
+                          .setSmallIcon(android.R.drawable.ic_media_play)
+                          .setContentTitle("Subway Bot работает")
+                          .setContentText("Открой Subway Surfers — бот сам начнёт")
+                          .addAction(0, "Снимок", pending(ACTION_SNAP))
+                          .addAction(0, "Стоп", pending(ACTION_STOP))
+                          .build();
+              }
+
+              private PendingIntent pending(String action) {
+                  Intent i = new Intent(this, BotService.class).setAction(action);
+                  return PendingIntent.getService(this, action.hashCode(), i,
+                          PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+              }
+
+              @Override
+              public void onDestroy() {
+                  running = false;
+                  if (display != null) display.release();
+                  if (reader != null) reader.close();
+                  if (projection != null) projection.stop();
+                  if (thread != null) thread.quitSafely();
+                  super.onDestroy();
+              }
+          }
+          __END_OF_FILE__
+          cat > app/src/main/java/com/example/subwaybot/MainActivity.java <<'__END_OF_FILE__'
+          package com.example.subwaybot;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.media.projection.MediaProjectionManager;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.util.DisplayMetrics;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.SeekBar;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          public class MainActivity extends Activity {
+              private static final int REQ_CAPTURE = 1;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  Cfg.load(this);
+
+                  int pad = (int) (16 * getResources().getDisplayMetrics().density);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(pad, pad, pad, pad);
+                  ScrollView sv = new ScrollView(this);
+                  sv.addView(root);
+                  setContentView(sv);
+
+                  TextView title = new TextView(this);
+                  title.setText("Subway Bot");
+                  title.setTextSize(24f);
+                  root.addView(title);
+
+                  TextView help = new TextView(this);
+                  help.setText("1) Включи «Subway Bot» в спец. возможностях.\n"
+                          + "2) Нажми «Старт» и выбери «Весь экран».\n"
+                          + "3) Открой Subway Surfers и начни забег — дальше бот сам.");
+                  root.addView(help);
+
+                  root.addView(button("1. Спец. возможности", v ->
+                          startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))));
+
+                  root.addView(button("2. Старт", v -> {
+                      if (BotAccessibility.instance == null) {
+                          Toast.makeText(this, "Сначала включи Subway Bot в спец. возможностях", Toast.LENGTH_LONG).show();
+                          startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+                          return;
+                      }
+                      MediaProjectionManager mpm = getSystemService(MediaProjectionManager.class);
+                      startActivityForResult(mpm.createScreenCaptureIntent(), REQ_CAPTURE);
+                  }));
+
+                  root.addView(button("Стоп", v -> stopService(new Intent(this, BotService.class))));
+
+                  TextView tune = new TextView(this);
+                  tune.setText("\nНастройка (если бот путает дорожки — жми «Снимок» в уведомлении и смотри кадр в галерее):");
+                  root.addView(tune);
+
+                  slider(root, "Чувствительность цвета (меньше = чувствительнее)", "sat", 40, 200, 95);
+                  slider(root, "Порог занятости дорожки, %", "block", 5, 60, 22);
+                  slider(root, "Взгляд вперёд (+ дальше, − ближе)", "shift", -5, 8, 0);
+                  slider(root, "Высота бегуна на экране, %", "py", 60, 90, 78);
+                  slider(root, "Разведение дорожек, %", "spread", 15, 45, 30);
+
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 0);
+                  }
+              }
+
+              @Override
+              @SuppressWarnings("deprecation")
+              protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (req != REQ_CAPTURE || res != RESULT_OK || data == null) return;
+
+                  DisplayMetrics dm = new DisplayMetrics();
+                  getWindowManager().getDefaultDisplay().getRealMetrics(dm);
+                  Intent i = new Intent(this, BotService.class)
+                          .putExtra("code", res)
+                          .putExtra("data", data)
+                          .putExtra("w", dm.widthPixels)
+                          .putExtra("h", dm.heightPixels)
+                          .putExtra("dpi", dm.densityDpi);
+                  startForegroundService(i);
+                  Toast.makeText(this, "Работает. Открой Subway Surfers", Toast.LENGTH_LONG).show();
+              }
+
+              private Button button(String text, android.view.View.OnClickListener l) {
+                  Button b = new Button(this);
+                  b.setText(text);
+                  b.setOnClickListener(l);
+                  return b;
+              }
+
+              private void slider(LinearLayout root, String label, String key, int min, int max, int def) {
+                  SharedPreferences sp = getSharedPreferences("cfg", MODE_PRIVATE);
+                  TextView tv = new TextView(this);
+                  SeekBar sb = new SeekBar(this);
+                  sb.setMin(min);
+                  sb.setMax(max);
+                  sb.setProgress(sp.getInt(key, def));
+                  tv.setText(label + ": " + sb.getProgress());
+                  sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override
+                      public void onProgressChanged(SeekBar s, int p, boolean fromUser) {
+                          tv.setText(label + ": " + p);
+                          sp.edit().putInt(key, p).apply();
+                          Cfg.load(MainActivity.this);
+                      }
+
+                      @Override
+                      public void onStartTrackingTouch(SeekBar s) {
+                      }
+
+                      @Override
+                      public void onStopTrackingTouch(SeekBar s) {
+                      }
+                  });
+                  root.addView(tv);
+                  root.addView(sb);
+              }
+          }
+          __END_OF_FILE__
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SubwayBot-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
